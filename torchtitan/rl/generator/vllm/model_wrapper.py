@@ -87,7 +87,7 @@ def _replace_vllm_layer_configs(model_config):
             ) = get_attention_dimensions(attention_cfg, model_config.dim)
             backend_cfg = attention_cfg.inner_attention
             is_mla = isinstance(backend_cfg, MLAAttention.Config)
-            if uses_compressed_mla_cache(backend_cfg):
+            if uses_compressed_mla_cache(attention_cfg):
                 vllm_attention_cfg = VLLMMLAAttention.Config(
                     wkv_b=backend_cfg.wkv_b,
                     packed_kv_head_dim=backend_cfg.packed_kv_head_dim,

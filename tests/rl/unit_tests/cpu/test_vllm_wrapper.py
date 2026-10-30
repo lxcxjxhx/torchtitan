@@ -242,6 +242,8 @@ def test_load_state_dict_allocates_one_fsdp_group_at_a_time(
 def test_vllm_replaces_mla_layer_configs(monkeypatch, compressed) -> None:
     """MLA uses the compressed cache unless batch invariance keeps materialized K/V."""
     monkeypatch.setattr(registry, "is_in_batch_invariant_mode", lambda: not compressed)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_: (10, 0))
     model_config = build_deepseek_config(
         "debugmodel",
         parallelism=ParallelismConfig(),

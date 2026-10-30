@@ -226,11 +226,14 @@ def test_batch_invariant_kda_registers_attention_gym_replay_state(monkeypatch):
     )
 
 
-@pytest.mark.parametrize(
-    "build_config", [build_dsv3_config, build_kimi_k3_config], ids=["dsv3", "kimi_k3"]
-)
-def test_compressed_mla_configures_vllm_native_mla(monkeypatch, build_config):
-    config = build_config(
+def _set_cuda_capability(monkeypatch, capability):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_: capability)
+
+
+def test_compressed_mla_configures_vllm_native_mla(monkeypatch):
+    _set_cuda_capability(monkeypatch, (10, 0))
+    config = build_dsv3_config(
         "debugmodel", parallelism=ParallelismConfig(), attn_backend="varlen"
     )
     assert registry.vllm_attention_backend(config) is None
@@ -250,3 +253,19 @@ def test_compressed_mla_configures_vllm_native_mla(monkeypatch, build_config):
     assert MODEL_ARCH_CONFIG_CONVERTORS[hf_config.model_type](
         hf_config, hf_config
     ).is_deepseek_mla()
+
+
+def test_compressed_mla_rejects_unsupported_dims_and_hardware(monkeypatch):
+    _set_cuda_capability(monkeypatch, (10, 0))
+    kimi_k3 = build_kimi_k3_config(
+        "debugmodel", parallelism=ParallelismConfig(), attn_backend="varlen"
+    )
+    with pytest.raises(ValueError, match="kv_lora_rank=512 and qk_rope_head_dim=64"):
+        registry.vllm_attention_backend(kimi_k3)
+
+    _set_cuda_capability(monkeypatch, (8, 0))
+    dsv3 = build_dsv3_config(
+        "debugmodel", parallelism=ParallelismConfig(), attn_backend="varlen"
+    )
+    with pytest.raises(ValueError, match="SM90 or SM100/SM103"):
+        registry.vllm_attention_backend(dsv3)

@@ -30,11 +30,13 @@ import logging
 import os
 from typing import Any, TYPE_CHECKING
 
+import torch
+
 from torchtitan.components.checkpointer import CheckpointManager
 from torchtitan.distributed.batch_invariant import is_in_batch_invariant_mode
 from torchtitan.models.common.attention import (
+    Attention,
     FlexInnerAttention,
-    InnerAttention,
     MLAAttention,
     VarlenInnerAttention,
 )
@@ -64,35 +66,62 @@ TORCHTITAN_MODEL_TYPE = "torchtitan"
 TORCHTITAN_WORKER_CLS = "torchtitan.rl.generator.vllm.worker.TorchTitanGPUWorker"
 
 
-def uses_compressed_mla_cache(inner_attention: InnerAttention.Config) -> bool:
+COMPRESSED_MLA_CAPABILITIES = ((9, 0), (10, 0), (10, 3))
+
+
+def uses_compressed_mla_cache(attention: Attention.Config) -> bool:
     """Return whether an attention layer caches MLA's compressed latent in vLLM.
 
     The cache layout and the generator's attention layers must agree, so every
     compressed-vs-materialized decision goes through this predicate.
     Batch-invariant mode keeps materialized K/V for bitwise parity with the
     trainer.
+
+    Raises ``ValueError`` when the layer would use the compressed cache but
+    Attention Gym's latent decode cannot run it: that needs
+    ``kv_lora_rank=512``, ``qk_rope_head_dim=64``, and an SM90 (FlashAttention-3)
+    or SM100/SM103 (FlashAttention-4) GPU.
     """
-    return (
-        isinstance(inner_attention, MLAAttention.Config)
-        and not is_in_batch_invariant_mode()
+    if (
+        not isinstance(attention.inner_attention, MLAAttention.Config)
+        or is_in_batch_invariant_mode()
+    ):
+        return False
+    if attention.kv_lora_rank != 512 or attention.qk_rope_head_dim != 64:
+        raise ValueError(
+            "The compressed MLA cache requires kv_lora_rank=512 and "
+            f"qk_rope_head_dim=64, got {attention.kv_lora_rank} and "
+            f"{attention.qk_rope_head_dim}. Enable batch-invariant mode to use "
+            "materialized K/V instead."
+        )
+    capability = (
+        torch.cuda.get_device_capability()
+        if torch.cuda.is_available() and torch.version.hip is None
+        else None
     )
+    if capability not in COMPRESSED_MLA_CAPABILITIES:
+        raise ValueError(
+            "The compressed MLA cache requires an SM90 or SM100/SM103 CUDA GPU, "
+            f"got {capability}. Enable batch-invariant mode to use materialized "
+            "K/V instead."
+        )
+    return True
 
 
 def vllm_attention_backend(cfg: Decoder.Config) -> AttentionBackendEnum | None:
     """Return the vLLM attention backend for ``cfg``'s full attention layers.
 
-    Returns ``None`` for MLA with a compressed cache: vLLM auto-selects one of
-    its MLA backends for the hardware, since vLLM's MLA kernel runs on that path
-    rather than a TorchTitan inner attention.
+    Returns ``None`` for MLA with a compressed cache: each compressed MLA layer
+    passes TorchTitan's decode and prefill backends to vLLM directly.
     """
     from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
     attention = cfg.first_full_attention
     if attention is None:
         raise ValueError("No full attention layer found in the model spec.")
-    kernel_config = attention.inner_attention
-    if uses_compressed_mla_cache(kernel_config):
+    if uses_compressed_mla_cache(attention):
         return None
+    kernel_config = attention.inner_attention
     if isinstance(kernel_config, MLAAttention.Config):
         kernel_config = kernel_config.inner_attention
     if isinstance(kernel_config, FlexInnerAttention.Config):
@@ -168,7 +197,7 @@ def model_config_to_hf_config_dict(cfg: Decoder.Config) -> dict[str, Any]:
         "eos_token_id": None,
     }
 
-    if uses_compressed_mla_cache(attn.inner_attention):
+    if uses_compressed_mla_cache(attn):
         hf["kv_lora_rank"] = attn.kv_lora_rank
         hf["qk_nope_head_dim"] = attn.qk_nope_head_dim
         hf["qk_rope_head_dim"] = attn.qk_rope_head_dim
