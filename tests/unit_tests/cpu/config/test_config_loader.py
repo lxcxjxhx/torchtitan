@@ -10,7 +10,8 @@ from unittest import mock
 
 import pytest
 
-from torchtitan.config import ConfigLoader, OverrideConfig, ParallelismConfig
+from torchtitan.config import ConfigLoader, OverrideConfig
+from torchtitan.config.parallelism import ParallelismConfig
 
 
 def test_loads_exact_recipe_module() -> None:
