@@ -145,12 +145,13 @@ class ValidationConfig:
                   start at the end of the step in which pass 0 ends. Several validation steps that
                   come while one pass runs merge into one deferred pass.
         step 100: a pass that ends in step 100, or is still running, is logged at step 100; the
-                  final pass then logs at step 101.
+                  final pass then logs at step 101. Accepted cost: a later run that extends this one
+                  into the same W&B run id logs training step 101 to a committed row, and W&B drops it.
     """
 
     steps: int = 20
     """Maximum prompts per pass. -1 consumes one finite source pass; 0 disables validation
-    (leave `freq` None)."""
+    (leave `freq` None and `overlap_training` False)."""
 
     freq: int | None = None
     """Also validate after every `freq` train steps; None validates only before and after."""
@@ -159,18 +160,18 @@ class ValidationConfig:
     """False: training waits for each pass, so all its rollouts sample one policy.
     True: the pre-training and periodic passes run beside training on the same generators:
     - at the lowest vLLM priority, so on busy generators a pass takes longer;
-    - a rollout's later tokens can sample a newer policy (`validation/max_policy_version`);
-    - a failed pass logs `validation/pass_failures`; training continues.
-    Keep False for a clean pre-training score."""
+    - a rollout's later tokens can sample a newer policy (`validation/max_policy_version`).
+    A failed pass fails the run in both modes. Keep False for a clean pre-training score."""
 
     def __post_init__(self) -> None:
         if self.steps < -1:
             raise ValueError("validation steps must be -1 or non-negative")
         if self.freq is not None and self.freq <= 0:
             raise ValueError(f"validation freq must be positive, got {self.freq}")
-        if self.freq is not None and self.steps == 0:
+        if self.steps == 0 and (self.freq is not None or self.overlap_training):
             raise ValueError(
-                f"validation freq={self.freq} needs steps != 0; steps=0 disables validation"
+                f"validation freq={self.freq} / overlap_training={self.overlap_training} need "
+                "steps != 0; steps=0 disables validation"
             )
 
 
@@ -622,6 +623,13 @@ class Controller(Configurable):
         num_validation_groups = len(
             self._rollouter.get_validation_samples(validation.steps)
         )
+        # A blocking pass's group ids -1 .. -N must stay above the overlapped range, which the
+        # engine schedules after all training.
+        if num_validation_groups >= -OVERLAPPED_VALIDATION_FIRST_GROUP_ID:
+            raise ValueError(
+                f"validation has {num_validation_groups} prompts per pass; a blocking pass needs "
+                f"fewer than {-OVERLAPPED_VALIDATION_FIRST_GROUP_ID}. Lower validation.steps."
+            )
         rollout_concurrency = (
             num_training_rollouts + num_validation_groups
             if validation.freq is not None or validation.overlap_training
@@ -997,7 +1005,7 @@ class Controller(Configurable):
 
         final_pass_step = num_training_steps
         # Wait for a pass still running instead of cancelling it: its result gets logged, and the
-        # generators would keep serving its requests anyway. A failed pass doesn't raise here.
+        # generators would keep serving its requests anyway.
         if self._validation_task is not None:
             logger.info(
                 f"Training done; waiting for {self._validation_task.get_name()} before the final pass"
@@ -1006,7 +1014,8 @@ class Controller(Configurable):
             self._log_finished_validation(step=num_training_steps)
             # At the same step, W&B would keep only the final pass's values for keys both passes log.
             final_pass_step += 1
-        if pre_validation_task is not None and pre_validation_task.exception() is None:
+        if pre_validation_task is not None:
+            # Done and succeeded: a failed pass raised when it was logged.
             pre_validation = m.MetricsProcessor._aggregate_metrics(
                 pre_validation_task.result()
             )
@@ -1052,8 +1061,9 @@ class Controller(Configurable):
         return self._validation_task
 
     def _log_finished_validation(self, *, step: int) -> None:
-        """If the pass started by `_start_validation` has ended, log it at `step`. A failed pass logs
-        its error and `validation/pass_failures` instead of raising.
+        """If the pass started by `_start_validation` has ended, log it at `step`; if it failed, raise
+        its error, as a blocking pass does. Per-prompt errors don't raise: they count in
+        `validation/group_failures`.
 
         Logged at the step it ends, not the one it started at: metric backends need steps that never go back.
         """
@@ -1061,16 +1071,8 @@ class Controller(Configurable):
         if task is None or not task.done():
             return
         self._validation_task = None
-        error = task.exception()
-        if error is not None:
-            logger.error(
-                f"{task.get_name()} failed; logging validation/pass_failures at step {step}",
-                exc_info=error,
-            )
-            metrics = [m.Metric("validation/pass_failures", m.Sum(1.0))]
-        else:
-            logger.info(f"{task.get_name()} ended; logging it at step {step}")
-            metrics = task.result()
+        metrics = task.result()
+        logger.info(f"{task.get_name()} ended; logging it at step {step}")
         self.metrics_processor.log(step=step, metrics=metrics, is_validation=True)
 
     def _log_reward_delta(self, pre: dict[str, float], post: dict[str, float]) -> None:
