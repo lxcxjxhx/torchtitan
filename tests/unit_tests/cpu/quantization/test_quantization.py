@@ -483,6 +483,7 @@ def test_qwen3_recipes_resolve(monkeypatch, recipe):
             "loss",
             "fused_binary_activation",
             "rope",
+            "attention_residual_norm",
             "fp32_to_bf16_split",
         ]
 
