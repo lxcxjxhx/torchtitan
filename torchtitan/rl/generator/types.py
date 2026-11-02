@@ -58,9 +58,9 @@ class EngineRequest:
     prompt_token_ids: list[int]  # [prompt_tokens]
     sampling: SamplingConfig
     group_id: int
-    """Rollout group id. Sets the vLLM priority: lower is admitted first and preempted last.
-    Training ids grow as groups start. Validation ids count down and restart every pass, so a
-    pass runs in arrival order (not newest first):
+    """Rollout group id. Sets the vLLM priority (`_vllm_priority` in `vllm/engine.py`): lower is
+    admitted first and preempted last. Training ids grow as groups start. Validation ids count
+    down and restart every pass, so a pass runs in arrival order (not newest first):
     - blocking validation: -1, -2, ... -> priority -1, before training;
     - overlapped validation: -1_000_000, -1_000_001, ... -> priority 2**31 - 1, after training.
 

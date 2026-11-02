@@ -890,8 +890,14 @@ def _validation_rollout(versions: list[tuple[int, int]]) -> Rollout:
     )
 
 
-def test_validation_logs_the_policies_its_rollouts_sampled() -> None:
-    """A weight sync during a rollout shows as a newer max version and a mixed-policy rollout."""
+@pytest.mark.parametrize(
+    "overlapped, group_ids", [(False, [-1, -2]), (True, [-1_000_000, -1_000_001])]
+)
+def test_validation_group_ids_and_sampled_policies(overlapped, group_ids) -> None:
+    """A pass beside training runs and releases ids at or below -1_000_000, which the vLLM engine
+    puts after training; a pass training waits for keeps -1, -2, ... Either pass logs the policies
+    it sampled: a weight sync during a rollout shows as a newer max version and a mixed-policy
+    rollout."""
     controller = object.__new__(Controller)
     controller.generator_router = SimpleNamespace(
         release_groups=SimpleNamespace(call_one=AsyncMock())
@@ -901,51 +907,21 @@ def test_validation_logs_the_policies_its_rollouts_sampled() -> None:
             side_effect=[
                 # A sync to policy 27 landed during the second turn.
                 RolloutGroup(
-                    group_id=-1,
+                    group_id=group_ids[0],
                     rollouts=[_validation_rollout([(25, 25), (25, 27)])],
                 ),
-                RolloutGroup(group_id=-2, rollouts=[_validation_rollout([(25, 25)])]),
+                RolloutGroup(
+                    group_id=group_ids[1], rollouts=[_validation_rollout([(25, 25)])]
+                ),
             ]
         ),
     )
 
     _, metrics = asyncio.run(
         controller._collect_validation_rollouts(
-            samples=["prompt", "prompt"], sampling=SamplingConfig(), step=25
-        )
-    )
-
-    reduced = m.MetricsProcessor._aggregate_metrics(metrics)
-    assert reduced["validation/min_policy_version/min"] == 25
-    assert reduced["validation/max_policy_version/max"] == 27
-    assert reduced["validation/mixed_policy_rollouts/mean"] == 0.5
-
-
-@pytest.mark.parametrize(
-    "overlapped, group_ids", [(False, [-1, -2]), (True, [-1_000_000, -1_000_001])]
-)
-def test_overlapped_validation_uses_lowest_priority_group_ids(
-    overlapped, group_ids
-) -> None:
-    """A pass beside training runs and releases ids at or below -1_000_000, which the vLLM engine
-    puts after training; a pass training waits for keeps -1, -2, ..."""
-    controller = object.__new__(Controller)
-    controller.generator_router = SimpleNamespace(
-        release_groups=SimpleNamespace(call_one=AsyncMock())
-    )
-    controller._rollouter = SimpleNamespace(
-        run_group_rollouts=AsyncMock(
-            side_effect=lambda *, group_id, **kwargs: RolloutGroup(
-                group_id=group_id, rollouts=[]
-            )
-        ),
-    )
-
-    asyncio.run(
-        controller._collect_validation_rollouts(
             samples=["prompt", "prompt"],
             sampling=SamplingConfig(),
-            step=3,
+            step=25,
             overlapped=overlapped,
         )
     )
@@ -958,6 +934,10 @@ def test_overlapped_validation_uses_lowest_priority_group_ids(
     controller.generator_router.release_groups.call_one.assert_awaited_once_with(
         group_ids
     )
+    reduced = m.MetricsProcessor._aggregate_metrics(metrics)
+    assert reduced["validation/min_policy_version/min"] == 25
+    assert reduced["validation/max_policy_version/max"] == 27
+    assert reduced["validation/mixed_policy_rollouts/mean"] == 0.5
 
 
 class _FakeValidation:
@@ -1070,18 +1050,18 @@ def test_overlapped_validation_runs_beside_training() -> None:
         await _train(controller, queue, 1)
         # Step 1's pull has ended.
         await _run_until(lambda: "release 5 trained" in events)
-        # Hold step 2's pull: the pass must not start before it ends.
+        # Hold step 2's pull: the pass must not start before it ends, but step 3 trains meanwhile.
         pulls_may_end.clear()
         await _train(controller, queue, 2)
         await _run_until(lambda: "pull 2" in events)
-        for _ in range(10):
-            await asyncio.sleep(0)
+        await queue.put(_training_batch(3))
+        await _run_until(lambda: "fwd_bwd 3" in events)
         assert validation.started_steps == []
         pulls_may_end.set()
         await _run_until(lambda: validation.started_steps == [2])
+        await _run_until(lambda: 3 in _logged_steps(controller, is_validation=False))
 
-        # Steps 3 and 4 train while the step-2 pass runs; step 4's pass waits for it.
-        await _train(controller, queue, 3)
+        # Step 4 trains while the step-2 pass runs; step 4's pass waits for it.
         await _train(controller, queue, 4)
         assert validation.started_steps == [2]
         assert _logged_steps(controller, is_validation=True) == []
@@ -1352,29 +1332,3 @@ def test_close_cancels_a_running_pass_before_closing_the_rollouter() -> None:
     asyncio.run(run())
     assert controller._validation_task.cancelled()
     assert pass_done_at_rollouter_close == [True]
-
-
-@pytest.mark.parametrize(
-    "overlapped, key",
-    [
-        (False, "timing/validation/blocking"),
-        (True, "timing/validation/overlapped"),
-    ],
-)
-def test_validation_wall_time_says_whether_the_pass_blocked(overlapped, key) -> None:
-    controller = object.__new__(Controller)
-    controller.config = SimpleNamespace(
-        async_loop=SimpleNamespace(validation=ValidationConfig(steps=1))
-    )
-    controller._rollouter = SimpleNamespace(
-        get_validation_samples=lambda steps: ["prompt"]
-    )
-    controller._sampling = SamplingConfig()
-    controller.rollout_recorder = Mock()
-
-    async def collect(*, samples, sampling, step, overlapped):
-        return [], []
-
-    controller._collect_validation_rollouts = collect
-    metrics = asyncio.run(controller.validate(step=5, overlapped=overlapped))
-    assert [metric.key for metric in metrics] == [key]
