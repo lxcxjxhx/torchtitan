@@ -149,7 +149,8 @@ class ValidationConfig:
     """
 
     steps: int = 20
-    """Maximum prompts per pass. -1 consumes one finite source pass; 0 disables."""
+    """Maximum prompts per pass. -1 consumes one finite source pass; 0 disables validation
+    (leave `freq` None)."""
 
     freq: int | None = None
     """Also validate after every `freq` train steps; None validates only before and after."""
@@ -1422,7 +1423,8 @@ class Controller(Configurable):
                     if is_validation_step:
                         # Pause training until the pass ends. Only this loop syncs weights, so every
                         # validation rollout samples this step's policy; training rollouts keep generating.
-                        await pull_task
+                        with sl.log_trace_span("validation_wait_for_pull"):
+                            await pull_task
                         await self._validate_and_log(step=step)
                 else:
                     self._log_finished_validation(step=step)
