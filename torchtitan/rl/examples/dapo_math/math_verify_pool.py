@@ -22,7 +22,9 @@ import subprocess
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from multiprocessing import connection
+from typing import Literal
 
 from math_verify import parse, verify
 
@@ -31,6 +33,14 @@ logger = logging.getLogger(__name__)
 _BOXED_START = r"\boxed{"
 # From <sys/prctl.h>: signal this process when the thread that started it exits.
 _PR_SET_PDEATHSIG = 1
+
+
+@dataclass(frozen=True, slots=True)
+class MathVerifyResult:
+    """A score paired with its scoring-process outcome."""
+
+    score: float
+    status: Literal["scored", "timed_out", "worker_died"]
 
 
 class MathVerifyPool:
@@ -63,12 +73,18 @@ class MathVerifyPool:
         self._thread_local = threading.local()
 
     async def score(self, response: str, ground_truth: str) -> float:
-        """Return `score_math_response(response, ground_truth)`, or 0.0 on timeout."""
+        """Return the score, or 0.0 when scoring infrastructure fails."""
+        return (await self.score_with_outcome(response, ground_truth)).score
+
+    async def score_with_outcome(
+        self, response: str, ground_truth: str
+    ) -> MathVerifyResult:
+        """Score an answer and report whether infrastructure assigned a zero."""
         return await asyncio.get_running_loop().run_in_executor(
             self._executor, self._score_in_worker, response, ground_truth
         )
 
-    def _score_in_worker(self, response: str, ground_truth: str) -> float:
+    def _score_in_worker(self, response: str, ground_truth: str) -> MathVerifyResult:
         worker = getattr(self._thread_local, "worker", None)
         # Start a worker on this thread's first score, or after its last one exited.
         if worker is None or worker.poll() is not None:
@@ -78,21 +94,31 @@ class MathVerifyPool:
         worker.stdin.flush()
         # `connection.wait` uses poll(); select() rejects fds >= 1024.
         if connection.wait([worker.stdout], timeout=self._timeout_seconds):
-            # An empty line means the worker died mid-score; treat it like a timeout.
+            # An empty line means the worker died mid-score.
             score_line = worker.stdout.readline()
             if score_line:
-                return float(score_line)
+                return MathVerifyResult(score=float(score_line), status="scored")
+            status = "worker_died"
+        else:
+            status = "timed_out"
 
         worker.kill()
-        worker.wait()
-        # TODO: count these per step as a metric; today they only show in this warning.
-        logger.warning(
-            "Math-Verify worker gave no score within %s seconds, or died; killed it and "
-            "assigned zero reward. Response tail: %r",
-            self._timeout_seconds,
-            response[-200:],
-        )
-        return 0.0
+        exit_code = worker.wait()
+        if status == "timed_out":
+            logger.warning(
+                "Math-Verify worker gave no score within %s seconds; killed it and "
+                "assigned zero reward. Response tail: %r",
+                self._timeout_seconds,
+                response[-200:],
+            )
+        else:
+            logger.warning(
+                "Math-Verify worker died with exit code %s before returning a score; "
+                "assigned zero reward. Response tail: %r",
+                exit_code,
+                response[-200:],
+            )
+        return MathVerifyResult(score=0.0, status=status)
 
 
 def score_math_response(response: str, ground_truth: str) -> float:

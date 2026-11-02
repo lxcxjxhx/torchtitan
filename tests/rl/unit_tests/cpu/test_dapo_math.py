@@ -23,9 +23,11 @@ from torchtitan.rl.examples.dapo_math import (
     data as math_data,
     math_verify_pool,
     MathVerifyPool,
+    MathVerifyResult,
     RewardMathVerify,
     score_math_response,
 )
+from torchtitan.rl.observability import metrics as m
 from torchtitan.rl.rollout import Rollout, RolloutStatus, RolloutTurn
 from torchtitan.rl.rollout.types import RolloutTurnID
 
@@ -189,6 +191,49 @@ def test_math_verify_pool_replaces_a_killed_process() -> None:
     pool = MathVerifyPool(num_processes=1, timeout_seconds=1.0)
     assert asyncio.run(pool.score(r"\boxed{2000^{2000^{2000}}}", "34")) == 0.0
     assert asyncio.run(pool.score(r"\boxed{34}", "34")) == 1.0
+
+
+def test_math_verify_pool_reports_a_timeout() -> None:
+    pool = MathVerifyPool(num_processes=1, timeout_seconds=1.0)
+    result = asyncio.run(pool.score_with_outcome(r"\boxed{2000^{2000^{2000}}}", "34"))
+    assert result == MathVerifyResult(score=0.0, status="timed_out")
+
+
+def test_math_verify_pool_reports_a_worker_death(monkeypatch, tmp_path) -> None:
+    script = tmp_path / "dies.py"
+    script.write_text(
+        "import sys\nprint('ready', flush=True)\nsys.stdin.readline()\nsys.exit(7)\n"
+    )
+    monkeypatch.setattr(math_verify_pool, "__file__", str(script))
+    pool = MathVerifyPool(num_processes=1, timeout_seconds=1.0)
+
+    result = asyncio.run(pool.score_with_outcome(r"\boxed{34}", "34"))
+
+    assert result == MathVerifyResult(score=0.0, status="worker_died")
+
+
+def test_reward_records_math_verify_failures_as_metrics(monkeypatch) -> None:
+    reward = RewardMathVerify.Config().build()
+
+    async def score_with_outcome(*args, **kwargs) -> MathVerifyResult:
+        del args, kwargs
+        return MathVerifyResult(score=0.0, status="worker_died")
+
+    monkeypatch.setattr(reward._pool, "score_with_outcome", score_with_outcome)
+    rollout = _rollout(r"\boxed{34}")
+    sample = DapoMathSample(prompt="problem", ground_truth="34")
+
+    assert asyncio.run(reward(rollout, sample)) == 0.0
+    expected = [
+        ("math_verify/timeouts", 0.0),
+        ("math_verify/worker_deaths", 1.0),
+    ]
+    for metric, (expected_key, expected_value) in zip(
+        rollout.turns[-1].metrics, expected, strict=True
+    ):
+        assert metric.key == expected_key
+        assert isinstance(metric.value, m.Sum)
+        assert metric.value.value == expected_value
 
 
 def test_math_verify_pool_raises_when_a_process_fails_to_start(
