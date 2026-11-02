@@ -220,7 +220,7 @@ def rl_grpo_qwen35_9b_terminal_bench() -> Controller.Config:
             console_log_keys_validation=[
                 "validation_reward/_mean",
                 "validation_reward/_max",
-                "timing/validate",
+                "timing/validation/",
             ],
         ),
         trainer=Trainer.Config(
@@ -365,7 +365,7 @@ def rl_grpo_qwen35_35b_a3b_terminal_bench() -> Controller.Config:
             console_log_keys_validation=[
                 "validation_reward/_mean",
                 "validation_reward/_max",
-                "timing/validate",
+                "timing/validation/",
             ],
         ),
         trainer=Trainer.Config(
@@ -487,7 +487,7 @@ def rl_grpo_muse_glimmer_30b_terminal_bench() -> Controller.Config:
             console_log_keys_validation=[
                 "validation_reward/_mean",
                 "validation_reward/_max",
-                "timing/validate",
+                "timing/validation/",
             ],
         ),
         trainer=Trainer.Config(
