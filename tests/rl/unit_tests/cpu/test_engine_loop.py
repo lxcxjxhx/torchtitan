@@ -562,6 +562,7 @@ class _FakeEngine:
     `threads` records which threads admitted and stepped, and `shutdowns` which shut it down."""
 
     holds_session_kv = False
+    has_pending_work = False
 
     def __init__(self, step_hook: Callable[[], None] = lambda: None):
         self.step_hook = step_hook
@@ -597,7 +598,7 @@ class _FakeEngine:
         finished, self.running = self.running, []
         return [_finished(request_id) for request_id in finished]
 
-    def load_prefetched_model_state_dict(self) -> None:
+    def load_prefetched_model_state_dict(self, policy_version: int) -> None:
         pass
 
     def shutdown(self) -> None:
@@ -762,6 +763,38 @@ def test_close_releases_the_engine() -> None:
         assert shutdowns == [engine_thread.thread]
     finally:
         _stop_engine_thread(engine_thread)
+
+
+def test_background_cache_work_progresses_after_last_output(engine_thread) -> None:
+    drained = threading.Event()
+
+    class SavingEngine(_FakeEngine):
+        remaining_steps = 0
+
+        def step(self):
+            if self.running:
+                # More than one step burst: exercise both the inner step gate
+                # and the rank-0 decision not to sleep on the empty queue.
+                self.remaining_steps = 20
+            else:
+                self.remaining_steps -= 1
+            outputs = super().step()
+            self.has_pending_work = self.remaining_steps > 0
+            if not self.has_pending_work:
+                drained.set()
+            return outputs
+
+    async def run():
+        engine = SavingEngine()
+        loop = engine_thread(engine)
+        loop.start()
+        result = await asyncio.wait_for(_generate(loop, "r0"), _TIMEOUT_S)
+        assert result.request_id == "r0"
+        assert await asyncio.to_thread(drained.wait, _TIMEOUT_S)
+        assert engine.remaining_steps == 0
+        await asyncio.wait_for(loop.close(), _TIMEOUT_S)
+
+    asyncio.run(run())
 
 
 def test_actor_loop_takes_calls_while_the_engine_steps(engine_thread) -> None:

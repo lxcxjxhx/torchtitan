@@ -81,14 +81,25 @@ class GenerationEngine(Configurable, abc.ABC):
     def has_unfinished_requests(self) -> bool:
         """Whether any admitted request is still running."""
 
+    @property
+    def has_pending_work(self) -> bool:
+        """Whether this rank needs steps after request outputs finish (e.g. cache I/O).
+
+        This query must be noncollective: rank 0 also uses it to decide whether
+        to wait for new work. Engines with replicated schedulers must synchronize
+        background work before exposing it through this property.
+        """
+        return False
+
     @abc.abstractmethod
     def step(self) -> list[FinishedRequest]:
         """Run one engine step and return the requests it finished."""
 
     @abc.abstractmethod
-    def load_prefetched_model_state_dict(self) -> None:
+    def load_prefetched_model_state_dict(self, policy_version: int) -> None:
         """Load the prefetched model state dict into the model, and reset the KV cache when
-        configured."""
+        configured. The caller must associate the same weights with a policy version
+        across replicas; engines may use it to namespace shared KV."""
 
     @property
     def holds_session_kv(self) -> bool:

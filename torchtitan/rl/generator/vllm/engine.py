@@ -15,7 +15,7 @@ from typing import Any
 
 import torch
 from vllm import EngineArgs, LLMEngine, SamplingParams
-from vllm.config import AttentionConfig
+from vllm.config import AttentionConfig, KVTransferConfig
 from vllm.exceptions import VLLMClientError
 from vllm.outputs import RequestOutput
 from vllm.sampling_params import RequestOutputKind
@@ -60,11 +60,12 @@ def add_extra_vllm_engine_args(
     Raises ``ValueError`` for keys TorchTitan already set in ``engine_kwargs`` or
     derives from a config field, so they cannot silently diverge from it.
     """
-    # EngineArgs that TorchTitan sets only when the mapped config field is set (or
-    # derives from it), so they may be absent from engine_kwargs.
+    # EngineArgs backed by dedicated config fields, including optional arguments
+    # that may be absent from engine_kwargs.
     config_field_by_engine_arg = {
         "max_num_batched_tokens": "Generator.Config.max_num_batched_tokens",
         "compilation_config": "VLLMEngine.Config.cuda_graph",
+        "kv_transfer_config": "VLLMEngine.Config.kv_transfer_config",
         "seed": "Generator.Config.debug.seed",
     }
     owned_keys = sorted(
@@ -98,6 +99,10 @@ class VLLMEngine(GenerationEngine):
         cuda_graph: VLLMCudaGraphConfig = field(default_factory=VLLMCudaGraphConfig)
         """CUDA graph capture settings for the vLLM engine."""
 
+        kv_transfer_config: KVTransferConfig | None = None
+        """Native vLLM configuration for MooncakeStoreConnector. None: no connector. See
+        ``MOONCAKE_STORE.md`` for shared CPU KV storage and lifecycle requirements."""
+
         extra_engine_args: dict[str, Any] = field(default_factory=dict)
         """Additional keyword arguments passed to vLLM's ``EngineArgs``, for engine
         options without a dedicated field (e.g. ``{"watermark": 0.03}``). vLLM
@@ -111,6 +116,16 @@ class VLLMEngine(GenerationEngine):
         session_kv_holder: VLLMSessionKVHolder.Config | None = None
         """Keep each multi-turn session's cached prefix on GPU between its turns (see
         `VLLMSessionKVHolder`). None: off."""
+
+        def __post_init__(self):
+            if self.kv_transfer_config is None:
+                return
+            # TODO(acisseJZhong): support additional KV connectors, including MultiConnector.
+            if self.kv_transfer_config.kv_connector != "MooncakeStoreConnector":
+                raise ValueError(
+                    "Titan RL currently supports only MooncakeStoreConnector; "
+                    "MultiConnector and other KV connectors are not supported."
+                )
 
     def __init__(
         self,
@@ -131,6 +146,34 @@ class VLLMEngine(GenerationEngine):
         generator_name: str,
         output_dir: str,
     ):
+        kv_transfer_config = config.kv_transfer_config
+        self._uses_mooncake_store = kv_transfer_config is not None
+        if kv_transfer_config is not None:
+            cache_prefix = kv_transfer_config.kv_connector_extra_config.get(
+                "cache_prefix"
+            )
+            if not isinstance(cache_prefix, str) or not cache_prefix.strip():
+                raise ValueError("Mooncake Store requires a non-empty cache_prefix")
+            if any(
+                degree != 1
+                for degree in (
+                    parallelism.tensor_parallel_degree,
+                    parallelism.data_parallel_degree,
+                    parallelism.expert_parallel_degree,
+                )
+            ):
+                raise ValueError(
+                    "Mooncake Store currently requires TP=DP=EP=1 per generator: "
+                    "external_launcher replicates schedulers, but asynchronous KV "
+                    "completion is not synchronized across them. Use num_generators "
+                    "for independent replicas."
+                )
+            if reset_kv_cache_on_model_state_dict_load:
+                raise ValueError(
+                    "Mooncake Store requires reset_kv_cache_on_model_state_dict_load=False: "
+                    "asynchronous saves can still hold GPU blocks after requests finish. "
+                    "Policy-version salts isolate KV without resetting the cache."
+                )
         if (
             config.session_kv_holder is not None
             and reset_kv_cache_on_model_state_dict_load
@@ -140,6 +183,8 @@ class VLLMEngine(GenerationEngine):
                 "cannot reset the prefix cache while blocks are held"
             )
         self.config = config
+        # Initial random weights must never publish shared KV as trainer version 0.
+        self._loaded_policy_version: int | None = None
         self._reset_kv_cache_on_model_state_dict_load = (
             reset_kv_cache_on_model_state_dict_load
         )
@@ -176,6 +221,22 @@ class VLLMEngine(GenerationEngine):
         self._engine = LLMEngine.from_engine_args(
             engine_args, stat_loggers=stat_loggers
         )
+        if kv_transfer_config is not None and kv_transfer_config.is_kv_producer:
+            scheduler = self._engine.engine_core.engine_core.scheduler
+            # Check resolved KV groups: a finer hash is safe for full attention,
+            # but hybrid partial tails need a save after the request finishes.
+            # TODO(acisseJZhong): remove when vLLM submits those saves on no-forward steps.
+            # https://github.com/vllm-project/vllm/blob/main/vllm/v1/worker/kv_connector_model_runner_mixin.py
+            if (
+                scheduler.cache_config.enable_prefix_caching
+                and scheduler.mamba_partial_cache_hit
+            ):
+                raise ValueError(
+                    "Mooncake Store producers do not support hybrid partial-block "
+                    "prefix hits: vLLM can skip finish-time saves on zero-token "
+                    "steps, leaving GPU blocks pinned. Use full-block prefix "
+                    "matching instead of a finer prefix_match_unit."
+                )
         # Every rank holds the same blocks in its own scheduler; only the engine loop thread
         # touches them.
         self._session_kv_holder: VLLMSessionKVHolder | None = None
@@ -248,6 +309,7 @@ class VLLMEngine(GenerationEngine):
             distributed_executor_backend="external_launcher",
             gpu_memory_utilization=gpu_memory_limit,
             enforce_eager=self.config.cuda_graph.mode == "NONE",
+            kv_transfer_config=self.config.kv_transfer_config,
             attention_config=AttentionConfig(backend=vllm_attention_backend(model)),
             # Enables RequestOutput.metrics, so generator metrics can be returned
             disable_log_stats=False,
@@ -343,7 +405,21 @@ class VLLMEngine(GenerationEngine):
         rejected_requests: list[tuple[str, Exception]] = []
         for request in requests:
             prompt = {"prompt_token_ids": request.prompt_token_ids}
-            if not self._reset_kv_cache_on_model_state_dict_load:
+            if self._uses_mooncake_store:
+                if self._loaded_policy_version is None:
+                    rejected_requests.append(
+                        (
+                            request.request_id,
+                            ValueError(
+                                "Load trainer weights before using Mooncake Store"
+                            ),
+                        )
+                    )
+                    continue
+                # A rollout group's minimum version can outlive a weight update.
+                # Shared KV must identify the weights that actually computed it.
+                prompt["cache_salt"] = str(self._loaded_policy_version)
+            elif not self._reset_kv_cache_on_model_state_dict_load:
                 # Salt by the pinned version so a request only reuses KV
                 # computed under that version.
                 prompt["cache_salt"] = str(request.min_policy_version)
@@ -381,6 +457,16 @@ class VLLMEngine(GenerationEngine):
         """Whether any admitted request is still running."""
         return self._engine.has_unfinished_requests()
 
+    @property
+    def has_pending_work(self) -> bool:
+        if not self._uses_mooncake_store:
+            return False
+        # LLMEngine tracks user outputs only; the in-process scheduler also tracks
+        # finish-time saves and the completion steps that release their GPU blocks.
+        # TODO(acisseJZhong): expose scheduler work through the public LLMEngine interface:
+        # https://github.com/vllm-project/vllm/blob/main/vllm/v1/engine/llm_engine.py
+        return self._engine.engine_core.engine_core.scheduler.has_requests()
+
     def step(self) -> list[FinishedRequest]:
         """Run one engine step, a TP collective, and return the requests it finished."""
         with torch.no_grad():
@@ -402,11 +488,17 @@ class VLLMEngine(GenerationEngine):
                 self._session_kv_holder.num_evicted,
             )
 
-    def load_prefetched_model_state_dict(self) -> None:
+    def load_prefetched_model_state_dict(self, policy_version: int) -> None:
         """Copy the prefetched model state dict from pinned CPU memory into the model, and
         reset the KV cache when configured."""
+        if self._uses_mooncake_store and self.has_unfinished_requests():
+            raise RuntimeError(
+                "Mooncake Store requires drained weight updates: set "
+                "generator_router.hot_swap=False before loading weights"
+            )
         model = self._get_model()
         model.load_state_dict(model._prefetched_model_state_dict)
+        self._loaded_policy_version = policy_version
         if self._reset_kv_cache_on_model_state_dict_load:
             # Always reset running requests too: the only reason to reset is a strict
             # recompute under the new weights. Keeping running requests' KV while hiding

@@ -365,7 +365,10 @@ class EngineLoop:
                 # new requests and avoid a prefill in between every engine decode step, which is inefficient.
                 with sl.log_trace_span("vllm_engine_step_burst"):
                     for _ in range(self._max_engine_steps_between_decisions):
-                        if not self._engine.has_unfinished_requests():
+                        if not (
+                            self._engine.has_pending_work
+                            or self._engine.has_unfinished_requests()
+                        ):
                             break
                         finished_requests = self._engine.step()
                         self._request_dispatcher.process_finished_requests(
@@ -409,11 +412,13 @@ class EngineLoop:
                 "the engine loop applies or fails every load before deciding again"
             )
 
-        # * If there are outstanding generations, we drain the queue and make the next decision right away,
-        #   so outstanding generations can keep stepping.
-        # * If there are none, there is nothing to step, so we wait on the queue for the next decision.
+        # Keep stepping outstanding generations and background cache work after final outputs.
+        # Otherwise there is nothing to step, so wait on the queue for the next decision.
         messages: list[EngineLoopMessage]
-        if self._request_dispatcher.rank0_has_outstanding_generations():
+        if (
+            self._request_dispatcher.rank0_has_outstanding_generations()
+            or self._engine.has_pending_work
+        ):
             messages = []
         else:
             if pending_engine_requests:
@@ -492,7 +497,7 @@ class EngineLoop:
         The model state dict was already fetched into the engine's pinned CPU buffers; this
         performs the local CPU-to-GPU copy.
         """
-        self._engine.load_prefetched_model_state_dict()
+        self._engine.load_prefetched_model_state_dict(version)
         self.policy_version = version
         gc.collect()
 

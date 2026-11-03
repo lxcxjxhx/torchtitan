@@ -16,6 +16,7 @@ The uneven-decode integration test requires four GPUs and a torchrun launcher.
 
 import asyncio
 import concurrent.futures
+import copy
 import gc
 import math
 import os
@@ -65,6 +66,7 @@ from torchtitan.rl.observability import metrics as m
 from torchtitan.rl.routing.intra_generator import IntraGeneratorRouter
 from torchtitan.rl.routing.strategies import LeastLoadedRoutingStrategy
 from vllm import SamplingParams
+from vllm.config import KVTransferConfig
 from vllm.exceptions import VLLMValidationError
 from vllm.logprobs import FlatLogprobs, Logprob
 from vllm.sampling_params import RequestOutputKind
@@ -135,10 +137,18 @@ def _request_output(
     )
 
 
-def _vllm_engine(*, reset_kv_cache_on_model_state_dict_load=False, model=None):
+def _vllm_engine(
+    *,
+    reset_kv_cache_on_model_state_dict_load=False,
+    model=None,
+    kv_transfer_config=None,
+):
     """A `VLLMEngine` around a fake `LLMEngine` (no engine build)."""
     engine = VLLMEngine.__new__(VLLMEngine)
     engine._engine = _FakeLLMEngine()
+    engine.config = VLLMEngine.Config(kv_transfer_config=kv_transfer_config)
+    engine._uses_mooncake_store = kv_transfer_config is not None
+    engine._loaded_policy_version = None
     engine._reset_kv_cache_on_model_state_dict_load = (
         reset_kv_cache_on_model_state_dict_load
     )
@@ -181,7 +191,7 @@ def test_prefetch_model_state_dict_updates_staging_buffers_in_place():
         get_state_dict = AsyncMock(side_effect=fill_state_dict)
         with patch.object(generator_module.ts, "get_state_dict", get_state_dict):
             await generator.prefetch_model_state_dict()
-        engine.load_prefetched_model_state_dict()
+        engine.load_prefetched_model_state_dict(1)
 
         assert generator._prefetched_model_state_dict is staging_state_dict
         get_state_dict.assert_awaited_once_with(
@@ -519,7 +529,7 @@ def test_prefetched_model_state_dict_is_the_buffers_the_load_reads():
     )
 
     assert engine.prefetched_model_state_dict is buffers
-    engine.load_prefetched_model_state_dict()
+    engine.load_prefetched_model_state_dict(1)
     assert loaded == [buffers]
 
 
@@ -534,7 +544,7 @@ def test_reset_kv_cache_on_model_state_dict_load_controls_cache_reset(
         reset_kv_cache_on_model_state_dict_load=reset_kv_cache, model=model
     )
 
-    engine.load_prefetched_model_state_dict()
+    engine.load_prefetched_model_state_dict(1)
 
     expected = [((), {"reset_running_requests": True})] if reset_kv_cache else []
     assert cast(_FakeLLMEngine, engine._engine).reset_prefix_cache_calls == expected
@@ -543,6 +553,45 @@ def test_reset_kv_cache_on_model_state_dict_load_controls_cache_reset(
 def test_sampling_config_rejects_top_p_below_one():
     with pytest.raises(ValueError, match="top_p must be 1.0, got 0.95"):
         SamplingConfig(top_p=0.95)
+
+
+def test_mooncake_shared_cache_uses_loaded_weights_not_group_version():
+    model = SimpleNamespace(load_state_dict=Mock(), _prefetched_model_state_dict={})
+    engine = _vllm_engine(model=model, kv_transfer_config=_mooncake_transfer_config())
+    request = _engine_request("r0", min_policy_version=3)
+
+    # Random initial weights must not populate the shared trainer namespace.
+    assert len(engine.add_requests([request])) == 1
+    assert engine._engine.add_requests == []
+    engine.load_prefetched_model_state_dict(5)
+    assert engine.add_requests([request]) == []
+    assert engine._engine.add_requests[-1][1]["prompt"]["cache_salt"] == "5"
+
+    engine.load_prefetched_model_state_dict(6)
+    assert engine.add_requests([request]) == []
+    assert engine._engine.add_requests[-1][1]["prompt"]["cache_salt"] == "6"
+    assert engine._engine.reset_prefix_cache_calls == []
+
+
+def test_mooncake_rejects_weight_swap_during_generation():
+    model = SimpleNamespace(load_state_dict=Mock(), _prefetched_model_state_dict={})
+    engine = _vllm_engine(model=model, kv_transfer_config=_mooncake_transfer_config())
+    engine._engine.has_unfinished_requests = lambda: True
+    with pytest.raises(RuntimeError, match="hot_swap=False"):
+        engine.load_prefetched_model_state_dict(2)
+    model.load_state_dict.assert_not_called()
+    assert engine._loaded_policy_version is None
+
+
+def test_mooncake_failed_load_does_not_advance_cache_version():
+    model = SimpleNamespace(
+        load_state_dict=Mock(side_effect=RuntimeError("load failed")),
+        _prefetched_model_state_dict={},
+    )
+    engine = _vllm_engine(model=model, kv_transfer_config=_mooncake_transfer_config())
+    with pytest.raises(RuntimeError, match="load failed"):
+        engine.load_prefetched_model_state_dict(2)
+    assert engine._loaded_policy_version is None
 
 
 # --- vLLM metric timing math (the `_prepare_generation_request_metrics` helper) ---
@@ -662,12 +711,23 @@ def test_qwen36_27b_perf_config():
 # --- vLLM engine kwargs (what VLLMEngine passes to EngineArgs) ---
 
 
-def _build_engine_kwargs(monkeypatch, tmp_path, config: Generator.Config) -> dict:
+def _build_engine_kwargs(
+    monkeypatch, tmp_path, config: Generator.Config, *, scheduler=None
+) -> dict:
     """Build ``config.engine`` as the generator does, with vLLM's ``EngineArgs``,
     ``LLMEngine`` and model registration mocked; return the ``EngineArgs`` kwargs."""
     engine_args = Mock()
     monkeypatch.setattr(vllm_engine_module, "EngineArgs", engine_args)
-    monkeypatch.setattr(vllm_engine_module, "LLMEngine", Mock())
+    llm_engine = Mock()
+    llm_engine.from_engine_args.return_value.engine_core.engine_core.scheduler = (
+        scheduler
+        if scheduler is not None
+        else SimpleNamespace(
+            cache_config=SimpleNamespace(enable_prefix_caching=True),
+            mamba_partial_cache_hit=False,
+        )
+    )
+    monkeypatch.setattr(vllm_engine_module, "LLMEngine", llm_engine)
     monkeypatch.setattr(vllm_engine_module, "register_to_vllm", Mock())
     monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
     config.engine.build(
@@ -706,6 +766,117 @@ def test_extra_engine_args_reach_engine_args(monkeypatch, tmp_path):
     assert engine_kwargs["scheduling_policy"] == "priority"
 
 
+def _mooncake_transfer_config():
+    return KVTransferConfig(
+        kv_connector="MooncakeStoreConnector",
+        kv_role="kv_both",
+        kv_connector_extra_config={
+            "cache_prefix": "run-1",
+            "save_decode_cache": True,
+        },
+    )
+
+
+def test_mooncake_engine_args_and_namespace(monkeypatch, tmp_path):
+    monkeypatch.setenv("MOONCAKE_CONFIG_PATH", str(tmp_path / "store.json"))
+    transfer = _mooncake_transfer_config()
+    transfer.kv_connector_extra_config["load_async"] = False
+    original = copy.deepcopy(transfer)
+    config = Generator.Config(
+        model=_MODEL_CONFIG,
+        engine=VLLMEngine.Config(kv_transfer_config=transfer),
+    )
+    kwargs = _build_engine_kwargs(monkeypatch, tmp_path, config)
+    resolved = kwargs["kv_transfer_config"]
+    assert resolved.kv_connector == "MooncakeStoreConnector"
+    assert resolved.kv_role == "kv_both"
+    assert resolved.kv_connector_extra_config == {
+        "cache_prefix": "run-1",
+        "save_decode_cache": True,
+        "load_async": False,
+    }
+    assert transfer == original
+
+
+@pytest.mark.parametrize(
+    "field, value, match",
+    [
+        ("cache_prefix", "", "non-empty cache_prefix"),
+        ("cache_prefix", None, "non-empty cache_prefix"),
+    ],
+)
+def test_mooncake_passthrough_rejects_unsafe_settings(
+    monkeypatch, tmp_path, field, value, match
+):
+    transfer = _mooncake_transfer_config()
+    if value is None:
+        transfer.kv_connector_extra_config.pop(field)
+    else:
+        transfer.kv_connector_extra_config[field] = value
+    config = Generator.Config(
+        model=_MODEL_CONFIG,
+        engine=VLLMEngine.Config(kv_transfer_config=transfer),
+    )
+    with pytest.raises(ValueError, match=match):
+        _build_engine_kwargs(monkeypatch, tmp_path, config)
+
+
+@pytest.mark.parametrize("degree", ["tensor_parallel_degree", "data_parallel_degree"])
+def test_mooncake_rejects_replicated_schedulers(monkeypatch, tmp_path, degree):
+    config = Generator.Config(
+        model=_MODEL_CONFIG,
+        engine=VLLMEngine.Config(kv_transfer_config=_mooncake_transfer_config()),
+    )
+    setattr(config.parallelism, degree, 2)
+    with pytest.raises(ValueError, match="TP=DP=EP=1"):
+        _build_engine_kwargs(monkeypatch, tmp_path, config)
+
+
+@pytest.mark.parametrize(
+    "role, partial_hits, prefix_caching, rejected",
+    [
+        ("kv_both", True, True, True),
+        ("kv_producer", True, True, True),
+        ("kv_consumer", True, True, False),
+        ("kv_both", False, True, False),
+        ("kv_both", True, False, False),
+        (None, True, True, False),
+    ],
+)
+def test_mooncake_rejects_hybrid_partial_tail_saves(
+    monkeypatch, tmp_path, role, partial_hits, prefix_caching, rejected
+):
+    transfer = _mooncake_transfer_config() if role is not None else None
+    if transfer is not None:
+        transfer.kv_role = role
+    config = Generator.Config(
+        model=_MODEL_CONFIG,
+        engine=VLLMEngine.Config(kv_transfer_config=transfer),
+    )
+    scheduler = SimpleNamespace(
+        cache_config=SimpleNamespace(enable_prefix_caching=prefix_caching),
+        mamba_partial_cache_hit=partial_hits,
+    )
+    if rejected:
+        with pytest.raises(ValueError, match="hybrid partial-block prefix hits"):
+            _build_engine_kwargs(monkeypatch, tmp_path, config, scheduler=scheduler)
+    else:
+        _build_engine_kwargs(monkeypatch, tmp_path, config, scheduler=scheduler)
+
+
+@pytest.mark.parametrize(
+    "connector", ["MultiConnector", "SimpleCPUOffloadConnector", "MooncakeConnector"]
+)
+def test_unsupported_kv_connector_rejected_at_config_creation(connector):
+    with pytest.raises(ValueError, match="supports only MooncakeStoreConnector"):
+        VLLMEngine.Config(
+            kv_transfer_config=KVTransferConfig(
+                kv_connector=connector,
+                kv_role="kv_both",
+            )
+        )
+
+
 @pytest.mark.parametrize(
     "key, match",
     [
@@ -717,6 +888,7 @@ def test_extra_engine_args_reach_engine_args(monkeypatch, tmp_path):
             r"use Generator\.Config\.max_num_batched_tokens",
         ),
         ("seed", r"use Generator\.Config\.debug\.seed"),
+        ("kv_transfer_config", r"use VLLMEngine\.Config\.kv_transfer_config"),
     ],
 )
 def test_extra_engine_args_rejects_torchtitan_owned_keys(key, match):
