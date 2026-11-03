@@ -10,12 +10,15 @@ from __future__ import annotations
 
 import logging
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from hashlib import sha256
 from typing import Any
 
 import torch
+import torch.distributed as dist
 from vllm import EngineArgs, LLMEngine, SamplingParams
 from vllm.config import AttentionConfig, KVTransferConfig
+from vllm.distributed import get_world_group
 from vllm.exceptions import VLLMClientError
 from vllm.outputs import RequestOutput
 from vllm.sampling_params import RequestOutputKind
@@ -148,26 +151,28 @@ class VLLMEngine(GenerationEngine):
     ):
         kv_transfer_config = config.kv_transfer_config
         self._uses_mooncake_store = kv_transfer_config is not None
+        self._coordinate_mooncake = self._uses_mooncake_store and (
+            parallelism.tensor_parallel_degree * parallelism.data_parallel_degree > 1
+        )
+        self._mooncake_work = [False, False]
         if kv_transfer_config is not None:
+            if (
+                self._coordinate_mooncake
+                and kv_transfer_config.kv_connector_module_path
+                not in (
+                    None,
+                    "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.connector",
+                )
+            ):
+                raise ValueError(
+                    "Multi-GPU Mooncake Store requires vLLM's built-in connector; "
+                    "a custom kv_connector_module_path cannot use Titan's coordination."
+                )
             cache_prefix = kv_transfer_config.kv_connector_extra_config.get(
                 "cache_prefix"
             )
             if not isinstance(cache_prefix, str) or not cache_prefix.strip():
                 raise ValueError("Mooncake Store requires a non-empty cache_prefix")
-            if any(
-                degree != 1
-                for degree in (
-                    parallelism.tensor_parallel_degree,
-                    parallelism.data_parallel_degree,
-                    parallelism.expert_parallel_degree,
-                )
-            ):
-                raise ValueError(
-                    "Mooncake Store currently requires TP=DP=EP=1 per generator: "
-                    "external_launcher replicates schedulers, but asynchronous KV "
-                    "completion is not synchronized across them. Use num_generators "
-                    "for independent replicas."
-                )
             if reset_kv_cache_on_model_state_dict_load:
                 raise ValueError(
                     "Mooncake Store requires reset_kv_cache_on_model_state_dict_load=False: "
@@ -204,6 +209,7 @@ class VLLMEngine(GenerationEngine):
             gpu_memory_limit=gpu_memory_limit,
             max_num_batched_tokens=max_num_batched_tokens,
             seed=debug.seed,
+            generator_name=generator_name,
         )
         tp_degree = parallelism.tensor_parallel_degree
         stat_loggers = None
@@ -279,6 +285,7 @@ class VLLMEngine(GenerationEngine):
         gpu_memory_limit: float,
         max_num_batched_tokens: int | None,
         seed: int | None,
+        generator_name: str,
     ) -> EngineArgs:
         """Build the vLLM ``EngineArgs`` (see ``GenerationEngine`` for the arguments)."""
         enable_ep = parallelism.expert_parallel_degree > 1
@@ -341,6 +348,27 @@ class VLLMEngine(GenerationEngine):
         # - None: every full block boundary, as before v0.29. Blocks are still freed
         #   when the request moves past them; hashed ones stay reusable until evicted.
         engine_kwargs["prefix_cache_retention_interval"] = None
+        if self.config.kv_transfer_config is not None:
+            extra = dict(self.config.kv_transfer_config.kv_connector_extra_config)
+            # This option names an IPC socket, not a network port. Independent
+            # generators on the same host must not bind/unlink each other's socket.
+            extra.setdefault(
+                "lookup_rpc_port",
+                sha256(
+                    f"{extra['cache_prefix']}:{generator_name}".encode()
+                ).hexdigest()[:16],
+            )
+            engine_kwargs["kv_transfer_config"] = replace(
+                self.config.kv_transfer_config,
+                kv_connector_extra_config=extra,
+            )
+            if self._coordinate_mooncake:
+                engine_kwargs[
+                    "kv_transfer_config"
+                ].kv_connector_module_path = "torchtitan.rl.generator.vllm.mooncake"
+                engine_kwargs[
+                    "scheduler_cls"
+                ] = "torchtitan.rl.generator.vllm.mooncake.create_mooncake_scheduler"
         # FA2 requires block_size to be a multiple of 256
         if not has_cuda_capability(9, 0):
             engine_kwargs["block_size"] = 256
@@ -435,11 +463,16 @@ class VLLMEngine(GenerationEngine):
                 # prompts); the high-level entry stays resilient to vLLM internals vs
                 # vllm.inputs.tokens_input.
                 [engine_input] = self._engine.renderer.render_cmpl([prompt])
-                # vLLM appends a random suffix to the id; the scheduler knows only that one.
+                sampling_params = _build_sampling_params(request.sampling)
+                if self._coordinate_mooncake:
+                    sampling_params.extra_args = {
+                        "kv_transfer_params": {"titan_request_id": request.request_id}
+                    }
+                # Track vLLM's internal ID, which may include its random suffix.
                 internal_request_id = self._engine.add_request(
                     request_id=request.request_id,
                     prompt=engine_input,
-                    params=_build_sampling_params(request.sampling),
+                    params=sampling_params,
                     arrival_time=request.arrival_time,
                     priority=max(request.group_id, -1),
                 )
@@ -451,28 +484,60 @@ class VLLMEngine(GenerationEngine):
                     )
             except (ValueError, VLLMClientError) as exc:
                 rejected_requests.append((request.request_id, exc))
+        if self._coordinate_mooncake:
+            self._refresh_mooncake_work()
         return rejected_requests
 
     def has_unfinished_requests(self) -> bool:
         """Whether any admitted request is still running."""
+        if self._coordinate_mooncake:
+            return self._mooncake_work[0]
         return self._engine.has_unfinished_requests()
 
     @property
     def has_pending_work(self) -> bool:
         if not self._uses_mooncake_store:
             return False
+        if self._coordinate_mooncake:
+            return self._mooncake_work[1]
         # LLMEngine tracks user outputs only; the in-process scheduler also tracks
         # finish-time saves and the completion steps that release their GPU blocks.
         # TODO(acisseJZhong): expose scheduler work through the public LLMEngine interface:
         # https://github.com/vllm-project/vllm/blob/main/vllm/v1/engine/llm_engine.py
         return self._engine.engine_core.engine_core.scheduler.has_requests()
 
+    def _refresh_mooncake_work(self) -> None:
+        # Called only at all-rank admission/step boundaries. The engine loop's
+        # rank-0 queue check must never enter a collective through a property.
+        core = self._engine.engine_core.engine_core
+        work = torch.tensor(
+            [
+                self._engine.output_processor.has_unfinished_requests(),
+                core.scheduler.has_requests() or bool(core.batch_queue),
+            ],
+            dtype=torch.int32,
+        )
+        dist.all_reduce(work, op=dist.ReduceOp.MAX, group=get_world_group().cpu_group)
+        self._mooncake_work = [bool(value) for value in work.tolist()]
+
     def step(self) -> list[FinishedRequest]:
         """Run one engine step, a TP collective, and return the requests it finished."""
+        if self._coordinate_mooncake and self._engine.dp_group is not None:
+            core = self._engine.engine_core.engine_core
+            # Idle DP replicas must still join the EP forward. Include KV-only
+            # steps, which upstream executes as dummy forwards under DP.
+            self._engine.has_unfinished_requests_dp(core.scheduler.has_requests())
+            if self._engine.should_execute_dummy_batch:
+                self._engine.should_execute_dummy_batch = False
+                self._engine.engine_core.execute_dummy_batch()
+            # Continue into step even after a dummy forward: this DP replica may
+            # still have queued async outputs and KV completions to drain.
         with torch.no_grad():
             request_outputs = self._engine.step()
         if self._session_kv_holder is not None:
             self._session_kv_holder.after_step()
+        if self._coordinate_mooncake:
+            self._refresh_mooncake_work()
         return [_finished_request(request_output) for request_output in request_outputs]
 
     def release_sessions(self, session_ids: list[str], group_ids: list[int]) -> None:
