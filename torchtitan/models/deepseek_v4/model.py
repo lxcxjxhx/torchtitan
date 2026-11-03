@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import copy
 from dataclasses import dataclass, field
 from typing import cast, TYPE_CHECKING
 
@@ -66,7 +67,7 @@ class DeepSeekV4TransformerBlock(TransformerBlock):
     def forward(
         self,
         x: torch.Tensor,
-        input_ids_T: torch.Tensor,
+        input_ids_T: torch.Tensor | None,
         attention_metadata: VarlenAttentionMetadata | None,
         positions: torch.Tensor | None = None,
         *,
@@ -77,7 +78,9 @@ class DeepSeekV4TransformerBlock(TransformerBlock):
 
         Args:
             x: Hidden states of shape ``[T, hc_mult, D]``.
-            input_ids_T: Token IDs of shape ``[T]`` used by hash routing.
+            input_ids_T: Token IDs of shape ``[T]`` used by hash routing; None
+                on PP stages after the first (``pipeline()`` rejects hash-routed
+                layers there).
             attention_metadata: Optional document offsets consumed by sparse
                 attention.
             positions: Optional position IDs of shape ``[T]``.
@@ -128,6 +131,67 @@ class DeepSeekV4Model(Decoder):
     """DeepSeek V4 decoder model with HC branches and sparse attention."""
 
     mtp_layers: "ModuleList[MTPBlock]"
+    # The last PP stage reduces the hyper-connection copies before the norm.
+    pipeline_last_stage_module_fqns = ("hc_head",)
+
+    def pipeline(self, **kwargs):
+        """Partition the model, after rejecting stage splits this forward cannot run."""
+        from torchtitan.distributed.pipeline_parallel import (
+            get_module_fqns_per_model_part,
+        )
+
+        if len(self.mtp_layers) > 0:
+            raise NotImplementedError(
+                f"DeepSeek V4 MTP ({len(self.mtp_layers)} layers) does not support "
+                "pipeline parallelism yet: the stage split would drop the MTP layers."
+            )
+        # TODO: PP on a fake process group (dry runs) builds static stage metadata
+        # with [T, dim] hidden states (_build_decoder_stage_io); these stages pass
+        # [T, hc_mult, dim].
+        pp_mesh = kwargs["parallelism_context"].get_mesh("pp")
+        if torch.distributed.get_backend(pp_mesh.get_group("pp")) == "fake":
+            raise ValueError(
+                "DeepSeek V4 PP does not support a fake process group yet: static "
+                "stage metadata assumes [T, dim] hidden states, but stages pass "
+                "[T, hc_mult, dim]."
+            )
+        # Check the configured split, or the default one with hc_head pinned to
+        # the last stage. The checked split is passed down, so it is the one built.
+        # TODO: share this "effective split" step with pipeline_kimi_k3 and
+        # pipeline_with_first_last_stage_modules through one public helper.
+        parallelism = kwargs["parallelism"]
+        module_fqns_per_stage = parallelism.pipeline_parallel_module_fqns_per_model_part
+        if module_fqns_per_stage is None:
+            module_fqns_per_stage = get_module_fqns_per_model_part(
+                self,
+                first_stage_module_fqns=self.pipeline_first_stage_module_fqns,
+                last_stage_module_fqns=self.pipeline_last_stage_module_fqns,
+                parallelism_context=kwargs["parallelism_context"],
+                parallelism=parallelism,
+                model_config=kwargs["model_config"],
+            )
+        num_stages = len(module_fqns_per_stage)
+        # TODO: pass token ids to every stage, so hash-routed layers can sit on any stage.
+        hash_routed_fqns = {
+            f"layers.{layer_id}"
+            for layer_id, layer in self.layers.items()
+            if isinstance(layer.feed_forward, MoE)
+            and getattr(layer.feed_forward.router, "hash", False)
+        }
+        for stage_index, module_fqns in enumerate(module_fqns_per_stage):
+            misplaced_fqns = sorted(hash_routed_fqns.intersection(module_fqns))
+            if misplaced_fqns and "tok_embeddings" not in module_fqns:
+                raise ValueError(
+                    "DeepSeek V4 PP: hash-routed layers need token ids, which only "
+                    f"the stage with tok_embeddings has. Virtual stage {stage_index} "
+                    f"of {num_stages} holds {misplaced_fqns}. Use fewer virtual "
+                    "stages, set pipeline_parallel_first_stage_less_layers=0, or put "
+                    "these layers on the first stage in "
+                    "pipeline_parallel_module_fqns_per_model_part."
+                )
+        parallelism = copy.copy(parallelism)  # the caller's config is not touched
+        parallelism.pipeline_parallel_module_fqns_per_model_part = module_fqns_per_stage
+        return super().pipeline(**{**kwargs, "parallelism": parallelism})
 
     @classmethod
     def _register_optimizer_hooks(
@@ -268,7 +332,6 @@ class DeepSeekV4Model(Decoder):
         self.hc_mult = cfg.hc_mult
         self.n_mtp_layers = cfg.n_mtp_layers
         self.compress_ratios = list(cfg.compress_ratios)[: cfg.n_layers]
-        self.n_main_layers = cfg.n_layers
 
         self.hc_head = cfg.hc_head.build()
         self.mtp_layers = ModuleList()
@@ -294,16 +357,20 @@ class DeepSeekV4Model(Decoder):
                 "cross entropy is not supported."
             )
 
-        input_ids_T = tokens.detach().long()
-        h = self.tok_embeddings(tokens) if self.tok_embeddings is not None else tokens
-        h = h.unsqueeze(1).repeat(1, self.hc_mult, 1)
+        if self.tok_embeddings is not None:
+            input_ids_T = tokens.detach().long()
+            h = self.tok_embeddings(tokens).unsqueeze(1).repeat(1, self.hc_mult, 1)
+        else:
+            # Later PP stage: ``tokens`` is the previous stage's [T, hc_mult, D] output.
+            input_ids_T = None
+            h = tokens
 
         with spmd.no_typecheck():
             main_aux_loss_denominator = (
                 None if aux_loss_denominators is None else aux_loss_denominators[0]
             )
-        for i in range(self.n_main_layers):
-            layer = self.layers[str(i)]
+        # A PP stage holds only some of the layers.
+        for layer in self.layers.values():
             layer_attention_metadata = (
                 None
                 if attention_metadata is None
@@ -318,6 +385,8 @@ class DeepSeekV4Model(Decoder):
                 aux_loss_denominator=main_aux_loss_denominator,
             )
 
+        if self.hc_head is None:  # PP stage before the last
+            return h
         prev_hc_hidden = h
         main_hidden = self.hc_head(h)
         main_hidden = self.norm(main_hidden) if self.norm is not None else main_hidden
